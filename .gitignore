@@ -30,7 +30,7 @@ tramp
 
 # elpa packages
 /elpa/
-
+*prebuilt*
 # reftex files
 *.rel
 
