@@ -5,6 +5,7 @@ from copy import deepcopy
 from typing import Optional
 
 import gradio as gr
+from decouple import config
 from ktem.app import BasePage
 from ktem.components import reasonings
 from ktem.db.models import Conversation, engine
@@ -23,6 +24,7 @@ from theflow.utils.modules import import_dotted_string
 
 from kotaemon.base import Document
 from kotaemon.indices.ingests.files import KH_DEFAULT_FILE_EXTRACTORS
+from kotaemon.indices.qa.utils import strip_think_tag
 
 from ...utils import SUPPORTED_LANGUAGE_MAP, get_file_names_regex, get_urls
 from ...utils.commands import WEB_SEARCH_COMMAND
@@ -367,13 +369,22 @@ class ChatPage(BasePage):
                             elem_id="citation-dropdown",
                         )
 
-                        self.use_mindmap = gr.State(value=True)
-                        self.use_mindmap_check = gr.Checkbox(
-                            label="Mindmap (on)",
-                            container=False,
-                            elem_id="use-mindmap-checkbox",
-                            value=True,
-                        )
+                        if not config("USE_LOW_LLM_REQUESTS", default=False, cast=bool):
+                            self.use_mindmap = gr.State(value=True)
+                            self.use_mindmap_check = gr.Checkbox(
+                                label="Mindmap (on)",
+                                container=False,
+                                elem_id="use-mindmap-checkbox",
+                                value=True,
+                            )
+                        else:
+                            self.use_mindmap = gr.State(value=False)
+                            self.use_mindmap_check = gr.Checkbox(
+                                label="Mindmap (off)",
+                                container=False,
+                                elem_id="use-mindmap-checkbox",
+                                value=False,
+                            )
 
             with gr.Column(
                 scale=INFO_PANEL_SCALES[False], elem_id="chat-info-panel"
@@ -1306,39 +1317,42 @@ class ChatPage(BasePage):
             chat_state,
         )
 
-        for response in pipeline.stream(chat_input, conversation_id, chat_history):
+        try:
+            for response in pipeline.stream(chat_input, conversation_id, chat_history):
 
-            if not isinstance(response, Document):
-                continue
+                if not isinstance(response, Document):
+                    continue
 
-            if response.channel is None:
-                continue
+                if response.channel is None:
+                    continue
 
-            if response.channel == "chat":
-                if response.content is None:
-                    text = ""
-                else:
-                    text += response.content
+                if response.channel == "chat":
+                    if response.content is None:
+                        text = ""
+                    else:
+                        text += response.content
 
-            if response.channel == "info":
-                if response.content is None:
-                    refs = ""
-                else:
-                    refs += response.content
+                if response.channel == "info":
+                    if response.content is None:
+                        refs = ""
+                    else:
+                        refs += response.content
 
-            if response.channel == "plot":
-                plot = response.content
-                plot_gr = self._json_to_plot(plot)
+                if response.channel == "plot":
+                    plot = response.content
+                    plot_gr = self._json_to_plot(plot)
 
-            chat_state[pipeline.get_info()["id"]] = reasoning_state["pipeline"]
+                chat_state[pipeline.get_info()["id"]] = reasoning_state["pipeline"]
 
-            yield (
-                chat_history + [(chat_input, text or msg_placeholder)],
-                refs,
-                plot_gr,
-                plot,
-                chat_state,
-            )
+                yield (
+                    chat_history + [(chat_input, text or msg_placeholder)],
+                    refs,
+                    plot_gr,
+                    plot,
+                    chat_state,
+                )
+        except ValueError as e:
+            print(e)
 
         if not text:
             empty_msg = getattr(
@@ -1361,6 +1375,7 @@ class ChatPage(BasePage):
         # check if this is a newly created conversation
         if len(chat_history) == 1:
             suggested_name = suggest_pipeline(chat_history).text
+            suggested_name = strip_think_tag(suggested_name)
             suggested_name = suggested_name.replace('"', "").replace("'", "")[:40]
             new_name = gr.update(value=suggested_name)
             renamed = True
