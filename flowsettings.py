@@ -403,3 +403,15 @@ KH_INDICES = [
     },
     *GRAPHRAG_INDICES,
 ]
+
+from pathlib import Path
+
+INDEX_ID = 1
+INDEX_NAME = "default"
+INDEX_CONFIG = {
+    "supported_file_types": ".pdf,.txt",
+    "max_file_size": 100,       # MB
+    "max_number_of_files": 100,
+}
+UPLOAD_TEMP_DIR = str(Path(__file__).parent / "tmp_uploads")
+Path(UPLOAD_TEMP_DIR).mkdir(parents=True, exist_ok=True)
