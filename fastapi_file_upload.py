@@ -1,5 +1,5 @@
 # fastapi_file_upload.py
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks,status, Body
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import shutil
@@ -9,9 +9,15 @@ from sqlalchemy.exc import IntegrityError
 from ktem.index.file.index import FileIndex
 from ktem.index.file.pipelines import IndexPipeline
 from ktem.db.engine import engine
-from sqlmodel import Session, select
-
+from ktem.db.models import User
+from sqlmodel import Session, select, SQLModel
+from typing import Optional
 import logging
+import hashlib
+import uuid
+from datetime import datetime
+from fastapi import status
+from typing import Dict
 
 from flowsettings import (
     INDEX_ID,
@@ -31,6 +37,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class UserCreate(SQLModel):
+    username: str
+    password: str
+    admin: Optional[bool] = False
+
+    
 # make sure our temp‐upload directory exists
 Path(UPLOAD_TEMP_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -160,12 +172,13 @@ async def search_files(query: str = Form(...), top_k: int = Form(5), user_id: st
 async def list_files(user_id: str = "api"):
     # 1) get the indexing “factory” and then use its Source model
     doc_pipeline = file_index.get_indexing_pipeline({}, user_id)
-    Source = doc_pipeline.Source  # this is the SQLModel/SQLAlchemy class for your source table
+    Source = doc_pipeline.Source  
 
     # 2) query all rows
     try:
         with Session(engine) as session:
-            rows = session.exec(select(Source)).all()
+            stmt = select(Source).where(Source.user == user_id)
+            rows = session.exec(stmt).all()
     except Exception as e:
         raise HTTPException(500, f"Could not list files: {e}")
 
@@ -184,7 +197,114 @@ async def list_files(user_id: str = "api"):
 
     return {"files": files}
 
+@app.get("/users/")
+async def list_users():
+    """
+    List every user row with its public fields.
+    Adjust the fields you expose as needed.
+    """
+    try:
+        with Session(engine) as session:
+            rows = session.exec(select(User)).all()
+    except Exception as e:
+        raise HTTPException(500, f"Could not list users: {e}")
 
+    return {
+        "users": [
+            {
+                "id": u.id,
+                "username": u.username,
+                "admin": u.admin,
+            }
+            for u in rows
+        ]
+    }
+
+@app.post("/users/", status_code=status.HTTP_201_CREATED)
+async def add_user(user_in: UserCreate = Body(...)):
+    """
+    Create a new user.
+
+    Expects **JSON**:
+    {
+      "username": "<string>",
+      "password": "<string>",
+      "admin": false   # optional
+    }
+    """
+    username_lower = user_in.username.lower()
+    password_hash = hashlib.sha256(user_in.password.encode()).hexdigest()
+
+    with Session(engine) as session:
+        # enforce one-username-per-instance, case-insensitive
+        duplicate = session.exec(
+            select(User).where(User.username_lower == username_lower)
+        ).first()
+        if duplicate:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Username '{user_in.username}' already exists.",
+            )
+
+        db_user = User(
+            username=user_in.username,
+            username_lower=username_lower,
+            password=password_hash,
+            admin=user_in.admin or False,
+        )
+        session.add(db_user)
+        session.commit()
+        session.refresh(db_user)
+
+    return {
+        "id": db_user.id,
+        "username": db_user.username,
+        "admin": db_user.admin,
+    }  
+
+
+@app.post("/files/{file_id}/duplicate/", status_code=status.HTTP_201_CREATED)
+async def duplicate_file(
+    file_id: str,
+    new_user_id: str = Form(...),
+):
+    """
+    Create a second Source row that points to the same underlying file,
+    but is owned by `new_user_id`.
+    """
+    # -- resolve the Source model exactly the same way as /files/ ----------
+    doc_pipeline = file_index.get_indexing_pipeline({}, new_user_id)
+    Source = doc_pipeline.Source
+
+    # -- look up the original record --------------------------------------
+    with Session(engine) as session:
+        original = session.get(Source, file_id)
+        if original is None:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        # -- build the duplicate row --------------------------------------
+        new_file_id = str(uuid.uuid4())
+        duplicate = Source(
+            id=new_file_id,
+            name=original.name,
+            path=original.path,
+            size=original.size,
+            user=new_user_id,
+            note=original.note,
+            date_created=datetime.utcnow(),      # or original.date_created
+        )
+
+        session.add(duplicate)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail="Could not duplicate file record (DB constraint).",
+            )
+
+    return {"new_file_id": new_file_id}
 import uvicorn
 
 
