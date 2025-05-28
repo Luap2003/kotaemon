@@ -19,6 +19,9 @@ from datetime import datetime
 from fastapi import status
 from typing import Dict
 
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parents[4]))
 from flowsettings import (
     INDEX_ID,
     INDEX_NAME,
@@ -27,7 +30,10 @@ from flowsettings import (
 )
 
 # --- app setup ---------------------------------------------------------------
-app = FastAPI(title="Kotaemon File‐Upload & Search API")
+app = FastAPI(title="Kotaemon File‐Upload & Search API",
+                  openapi_url="/openapi.json",
+    docs_url="/docs",
+    redoc_url="/redoc",)
 
 app.add_middleware(
     CORSMiddleware,
@@ -265,46 +271,74 @@ async def add_user(user_in: UserCreate = Body(...)):
 
 @app.post("/files/{file_id}/duplicate/", status_code=status.HTTP_201_CREATED)
 async def duplicate_file(
+    background_tasks: BackgroundTasks,
     file_id: str,
+    original_user_id: str = Form(...),
     new_user_id: str = Form(...),
 ):
     """
-    Create a second Source row that points to the same underlying file,
-    but is owned by `new_user_id`.
+    Clone a file’s metadata *and* its index‐table entries
+    so the new user sees the exact same chunks & embeddings.
     """
-    # -- resolve the Source model exactly the same way as /files/ ----------
-    doc_pipeline = file_index.get_indexing_pipeline({}, new_user_id)
-    Source = doc_pipeline.Source
+    # 1) spin up two pipelines—one for the original user, one for the new user—
+    #    and route on a dummy “.pdf” so we get the right models & FSPath.
+    dummy_pdf = Path("dummy.pdf")
+    orig_pipe = file_index.get_indexing_pipeline({}, original_user_id).route(dummy_pdf)
+    new_pipe  = file_index.get_indexing_pipeline({}, new_user_id).route(dummy_pdf)
 
-    # -- look up the original record --------------------------------------
+    Source     = orig_pipe.Source       # SQLModel class for your files table
+    IndexEntry = orig_pipe.Index        # SQLModel class for your index‐mapping table
+
     with Session(engine) as session:
-        original = session.get(Source, file_id)
-        if original is None:
-            raise HTTPException(status_code=404, detail="File not found")
-
-        # -- build the duplicate row --------------------------------------
-        new_file_id = str(uuid.uuid4())
-        duplicate = Source(
-            id=new_file_id,
-            name=original.name,
-            path=original.path,
-            size=original.size,
-            user=new_user_id,
-            note=original.note,
-            date_created=datetime.utcnow(),      # or original.date_created
+        # --- fetch the original file (inside the session!) ----------------
+        stmt = select(Source).where(
+            Source.id   == file_id,
+            Source.user == original_user_id
         )
+        original = session.exec(stmt).one_or_none()
+        if not original:
+            raise HTTPException(status_code=404, detail="Original file not found")
 
-        session.add(duplicate)
+        # --- create the new Source row ------------------------------------
+        new_id = str(uuid.uuid4())
+        cloned = Source(
+            id           = new_id,
+            name         = original.name,
+            path         = original.path,
+            size         = original.size,
+            user         = new_user_id,
+            note         = original.note,
+            date_created = datetime.utcnow(),
+        )
+        session.add(cloned)
+
+        # --- clone every Index entry for that file ------------------------
+        idxs = session.exec(
+            select(IndexEntry).where(IndexEntry.source_id == file_id)
+        ).all()
+        for entry in idxs:
+            session.add(IndexEntry(
+                source_id     = new_id,
+                target_id     = entry.target_id,
+                relation_type = entry.relation_type,
+            ))
+
+        # --- commit all at once -------------------------------------------
         try:
             session.commit()
         except IntegrityError:
             session.rollback()
             raise HTTPException(
                 status_code=500,
-                detail="Could not duplicate file record (DB constraint).",
+                detail="Failed to clone file/index entries"
             )
 
-    return {"new_file_id": new_file_id}
+    return {"new_file_id": new_id}
+
+
+
+
+
 import uvicorn
 
 
