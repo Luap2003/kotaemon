@@ -26,6 +26,7 @@ import asyncio
 from typing import List
 from pathlib import Path
 import time
+from ktem.api.endpoint_helpers import fetch_users, upload_pdf, duplicate_pdf
 sys.path.append(str(Path(__file__).parents[4]))
 from flowsettings import (
     INDEX_ID,
@@ -476,6 +477,89 @@ async def add_files_to_group(
 
     return {"group_id": updated_group_id, "files": merged}
 
+
+@app.post(
+    "/distribute_pdf/",
+    summary="Upload a PDF to the admin account and duplicate it to every other user",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def distribute_pdf(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(..., description="The PDF you want to distribute"),
+    wait_time: int = Form(20, description="Seconds to wait before duplicating"),
+    api_base_url: str = Form(
+        "http://localhost:7860/dokumentation",
+        description="Root URL where this API is reachable",
+    ),
+):
+    """
+    • GET **/users/** → detect the single *admin* account  
+    • POST **/upload/**  → store the PDF for that admin  
+    • After `wait_time` s, POST **/files/{id}/duplicate/** for every non-admin user
+
+    All work is done via ordinary HTTP calls so you reuse exactly the same
+    validation, deduping, and background-indexing logic already exposed by
+    your existing routes.
+    """
+    # -----------------------------------------------------------------------
+    # Step 1 – Collect the user list + find the admin
+    # -----------------------------------------------------------------------
+    users = await fetch_users(api_base_url)
+    admin = next((u for u in users if u.get("admin")), None)
+    if not admin:
+        raise HTTPException(500, "No admin user found")
+    admin_user_id = admin["id"]
+
+    # -----------------------------------------------------------------------
+    # Step 2 – Upload the PDF to the admin account
+    # -----------------------------------------------------------------------
+    file_bytes = await file.read()
+    file_id = await upload_pdf(
+        api_base_url=api_base_url,
+        file_bytes=file_bytes,
+        filename=file.filename,
+        user_id=admin_user_id,
+    )
+
+    # -----------------------------------------------------------------------
+    # Step 3 – schedule the duplicate run in the background
+    # -----------------------------------------------------------------------
+    async def _duplicate_to_everyone():
+        await asyncio.sleep(max(0, wait_time))
+
+        tasks = []
+        for u in users:
+            if u["id"] == admin_user_id:   # skip the admin themself
+                continue
+            tasks.append(
+                duplicate_pdf(
+                    api_base_url=api_base_url,
+                    file_id=file_id,
+                    original_user_id=admin_user_id,
+                    new_user_id=u["id"],
+                )
+            )
+
+        # run the /duplicate/ calls concurrently
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        successes = sum(1 for r in results if not isinstance(r, Exception))
+        failures  = len(results) - successes
+        logging.info(
+            "[distribute_pdf] finished – duplicated to %d users (%d failures)",
+            successes,
+            failures,
+        )
+
+    background_tasks.add_task(_duplicate_to_everyone)
+
+    return {
+        "status": "accepted",
+        "file_id": file_id,
+        "admin_user_id": admin_user_id,
+        "msg": f"PDF stored for admin; will distribute to everyone else in ≈{wait_time}s",
+    }
+    
 import uvicorn
 
 
