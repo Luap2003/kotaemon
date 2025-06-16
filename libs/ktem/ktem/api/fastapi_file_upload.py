@@ -1,5 +1,5 @@
 # fastapi_file_upload.py
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks,status, Body
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks,status, Body, Path as APIPath
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import shutil
@@ -18,9 +18,14 @@ import uuid
 from datetime import datetime
 from fastapi import status
 from typing import Dict
-
+import zipfile, io
+import httpx
+from pydantic import BaseModel
 import sys
+import asyncio
+from typing import List
 from pathlib import Path
+import time
 sys.path.append(str(Path(__file__).parents[4]))
 from flowsettings import (
     INDEX_ID,
@@ -48,12 +53,29 @@ class UserCreate(SQLModel):
     password: str
     admin: Optional[bool] = False
 
+
+
+class GroupPayload(BaseModel):
+    group_id: Optional[str] = None    # pass None to create a new group
+    group_name: str
+    file_ids: List[str]               # the list of file UUIDs to add
+    user_id: str   
+    
+class AddFilesPayload(BaseModel):
+    file_ids: List[str]
+    user_id: str
+
+class DistributePdfPayload(BaseModel):
+    wait_time: Optional[int] = 20  # seconds to wait for processing
     
 # make sure our temp‐upload directory exists
 Path(UPLOAD_TEMP_DIR).mkdir(parents=True, exist_ok=True)
 
 # one FileIndex instance per index
-file_index = FileIndex(app=None, id=INDEX_ID, name=INDEX_NAME, config=INDEX_CONFIG)
+file_index = FileIndex(app, id=INDEX_ID, name=INDEX_NAME, config=INDEX_CONFIG)
+
+file_index.on_create()
+file_index.on_start()
 
 
 @app.on_event("startup")
@@ -253,6 +275,7 @@ async def add_user(user_in: UserCreate = Body(...)):
             )
 
         db_user = User(
+            id=uuid.uuid4().hex,  # Explicitly generate UUID to avoid NOT NULL constraint
             username=user_in.username,
             username_lower=username_lower,
             password=password_hash,
@@ -337,7 +360,121 @@ async def duplicate_file(
 
 
 
+@app.post("/bulk_upload/")
+async def bulk_upload_zip(
+    zip_file: UploadFile = File(...),
+    user_id: str = Form("api"),
+    upload_url: str = Form("http://localhost:7860/dokumentation/upload/"),
+):
+    # read entire zip into memory
+    data = await zip_file.read()
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise HTTPException(400, "Uploaded file is not a valid ZIP archive.")
 
+    results = []
+    # async client to call our own upload endpoint
+    async with httpx.AsyncClient() as client:
+        for name in zf.namelist():
+            if not name.lower().endswith(".pdf"):
+                continue
+
+            pdf_bytes = zf.read(name)
+            files = {
+                "file": (name, pdf_bytes, "application/pdf")
+            }
+            form = {"user_id": user_id}
+
+            try:
+                resp = await client.post(upload_url, files=files, data=form)
+                resp.raise_for_status()
+                payload = resp.json()
+                results.append({
+                    "filename": name,
+                    "status": "accepted",
+                    "file_id": payload.get("file_id")
+                })
+            except httpx.HTTPStatusError as e:
+                # non-2xx from /upload/
+                results.append({
+                    "filename": name,
+                    "status": "error",
+                    "detail": f"{e.response.status_code}: {e.response.text}"
+                })
+            except Exception as e:
+                # network / parsing error
+                results.append({
+                    "filename": name,
+                    "status": "failed",
+                    "detail": str(e)
+                })
+
+    if not results:
+        raise HTTPException(400, "No PDF files found in the ZIP.")
+
+    return {"results": results}
+
+@app.post("/groups/", status_code=201)
+async def upsert_group(payload: GroupPayload):
+    """
+    Create a new file‐group or update an existing one.
+    - If payload.group_id is None, this will create a new group named payload.group_name.
+    - Otherwise it will rename/update the membership of the existing group.
+    """
+    try:
+        new_group_id = file_index.save_group(
+            payload.group_id,
+            payload.group_name,
+            payload.file_ids,
+            payload.user_id
+        )
+    except Exception as e:
+        # e.g. IntegrityError if you try to re-create an existing name
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"group_id": new_group_id}
+
+@app.post("/groups/{group_id}/files", status_code=200)
+async def add_files_to_group(
+    group_id: str = APIPath(..., description="UUID of the group to update"),
+    payload: AddFilesPayload = Body(...)
+):
+    """
+    Add files to an existing group.
+    - `group_id`: the UUID of the group to modify
+    - `payload.file_ids`: list of file UUIDs to add
+    - `payload.user_id`: owner of the group (must match)
+    """
+    # Access the SQLModel for FileGroup
+    FileGroup = file_index._resources["FileGroup"]
+    # Fetch the group and verify ownership
+    from sqlmodel import Session, select
+    with Session(engine) as session:
+        group = session.exec(
+            select(FileGroup).where(
+                FileGroup.id == group_id,
+                FileGroup.user == payload.user_id
+            )
+        ).one_or_none()
+        if not group:
+            raise HTTPException(404, detail="Group not found or not yours")
+
+    # Merge existing files with new ones (dedupe)
+    existing = group.data.get("files", [])
+    merged = list(dict.fromkeys(existing + payload.file_ids))
+
+    # Delegate to your FileIndex method to save
+    try:
+        updated_group_id = file_index.save_group(
+            group_id,
+            group.name,
+            merged,
+            payload.user_id
+        )
+    except Exception as e:
+        raise HTTPException(400, detail=str(e))
+
+    return {"group_id": updated_group_id, "files": merged}
 
 import uvicorn
 
